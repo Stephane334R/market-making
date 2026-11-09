@@ -1,0 +1,36 @@
+# Assistant config (never commit)
+CLAUDE.md
+.claude/
+
+# Data and results
+data/raw/*
+data/normalized/*
+!data/raw/.gitkeep
+!data/normalized/.gitkeep
+results/*
+!results/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Rust
+rust/target/
+
+# Secrets (public market data only; nothing should ever match these)
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
