@@ -1,0 +1,30 @@
+{
+  "hours": 24.0,
+  "fills": 155,
+  "fills_through_pct": 63.2,
+  "volume_notional": 180791.99,
+  "pnl_total": 54.87,
+  "pnl_spread_capture": 50.76,
+  "pnl_inventory": 40.27,
+  "pnl_fees": -36.16,
+  "pnl_per_volume_bps": 3.035,
+  "max_abs_inventory": 0.12,
+  "time_at_inventory_limit_pct": 36.56,
+  "hourly_pnl_mean": 0.77,
+  "hourly_pnl_std": 27.98,
+  "max_drawdown": -92.64,
+  "markout_bps": {
+    "0s": 2.809,
+    "0.1s": -0.513,
+    "0.5s": -1.1,
+    "1s": -1.23,
+    "2s": -1.211,
+    "5s": -1.179,
+    "10s": -1.165,
+    "30s": -0.529,
+    "60s": -0.157
+  },
+  "quotes": 287985,
+  "post_only_rejects": 0,
+  "mean_half_spread_bps": 4.2822413496672
+}

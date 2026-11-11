@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Market-making research framework for the Bybit BTCUSDT linear perpetual"
 requires-python = ">=3.11"
 dependencies = [
+    "matplotlib>=3.11.2",
+    "numpy>=2.4.6",
     "orjson>=3.13.0",
+    "pandas>=3.1.1",
     "pyarrow>=26.0.1",
 ]
 

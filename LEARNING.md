@@ -134,3 +134,68 @@ REST), `src/units.rs` (exact decimal -> int). Rust unit tests in `book.rs`/`unit
   mismatches; two redundant recorders on separate connections and a merge step; separate
   the network reader from the writer (bounded channel) and record raw frames as well;
   extend the schema with `cts` and trade `seq`/RPI; capture the instrument spec per file.
+
+## 3. Strategy, simulator and analytics (ported from crypto-market-making)
+
+Code: `python/mm/strategy.py`, `mm/simulator.py`, `mm/analytics.py`, `mm/plots.py`,
+`mm/backtest.py` (leave-days-out CV, `python -m mm.backtest`), `mm/report.py` (summary.md).
+Tests: `tests/test_simulator.py` (original tests ported plus L2 queue tests),
+`tests/test_sim_reference.py` (exact re-run of the committed reference outputs;
+`MM_RUN_REFERENCE=1`).
+
+- **What:** the same research loop as the Hyperliquid repo. A vol-scaled spread with
+  inventory skew (a practical Avellaneda-Stoikov), replayed event by event with latency,
+  post-only rejection and maker fees. PnL is split exactly into spread capture, inventory
+  and fees (identity tested), with fill markouts from 0 to 60 s. Parameters are selected on
+  the earlier days and the held-out days are reported as a per-day distribution.
+- **Adapted to the common schema:** prices are integer ticks, the book is rebuilt from
+  full-depth deltas (`iter_book_messages`), trades come from the normalized Parquet, and
+  units come from the file footer.
+- **New: L2 queue-position estimate** (`fill_model="l2_queue"`, the default; the original
+  `touch_ratio` model is kept for comparison).
+  - Joining a level puts the displayed size at our price ahead of us.
+  - Prints at our price consume that queue first.
+  - Size decreases not explained by prints are treated as pro-rata cancels.
+  - Amending down keeps priority; a larger size or a new price goes to the back.
+  - A print through our price fills our full size, as in the original.
+- **Performance design:** all 56 parameter sets replay in one pass per day. The book
+  rebuild dominates the cost, so the sets share the event stream, the EWMA vol, the
+  requote clock and the latency. Inventory PnL is accumulated lazily (exact telescoping
+  sum). States are sampled every 5 s. One pass takes 2.5-6 min per day; the 7-day CV takes
+  16 min on 2 workers (2 GB RAM).
+- **Bybit-specific choices:**
+  - Maker fee 0.02%, from Bybit's fee page.
+  - The grid is mapped to the Hyperliquid grid's *dollar* distances (Bybit's tick is 10x
+    finer), and extended past the ~150-tick fee break-even.
+- **Result (5 train / 2 held-out days, 2026-11-03..09):** no edge, as on Hyperliquid. All
+  configurations lose on train, and PnL improves monotonically with width up to the grid
+  edge. Held out: -109 ± 164 USDT/day (|t| < 1).
+  - Fees dominate near the touch.
+  - Markouts fall from +0.74 bps at the fill to -0.40 bps within 100 ms (hs=80).
+  - 80-92% of fills are prints through our price (sweeps), so the queue model changes PnL
+    by < 1%.
+  - At the Hyperliquid-equivalent setting Bybit loses more per day and per unit volume:
+    a higher fee, ~8x more trades, and a finer book; see the run's summary.md.
+- **Assumptions / simplifications (labelled in code and summary):**
+  - The queue position is estimated, not observed.
+  - No market impact.
+  - Constant 50 ms latency, instant cancels.
+  - No funding payments.
+  - Book `ts` and trade `T` are merged as one clock.
+  - Drawdown and time-at-limit are measured on 5 s samples.
+  - Every day starts flat.
+  - Selection rests on 5 days of one regime.
+- **What can go wrong:**
+  - Reading the grid-edge "best" as an optimum: it is the "don't trade" limit.
+  - Trusting per-day t-stats from 2 held-out days.
+  - Mapping parameters across venues in ticks rather than in dollars or bps.
+  - A different `vol_halflife_s` per set would break the shared-EWMA design; it is checked
+    and raises.
+- **Production-grade:**
+  - Port the event loop to Rust (`rust/sim`), validated against
+    `tests/reference/sim_bybit_2026-11-09*`.
+  - Model latency jitter and cancel latency.
+  - Model queue position with order-level (L3) data where available.
+  - Add funding and a toxicity filter.
+  - Validate the fill model against live fills on testnet.
+  - Use many more days, across regimes.
