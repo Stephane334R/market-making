@@ -5,3 +5,13 @@ edition = "2021"
 description = "Live websocket recorder for Bybit public market data"
 
 [dependencies]
+anyhow = "1.0.104"
+arrow = { version = "60.1.0", default-features = false }
+chrono = "0.4.45"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }

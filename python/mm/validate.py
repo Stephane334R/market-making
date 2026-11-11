@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
@@ -81,3 +83,55 @@ def continuity(day_reports: list[dict]) -> list[dict]:
             }
         )
     return out
+
+
+def validate_book_files(paths: list[Path], depth_limit: int | None) -> dict:
+    """Validate several consecutive files as ONE stream (e.g. a recorder session rotated
+    every N minutes): the book carries over file boundaries, so a file that starts with
+    a delta is not flagged as 'delta before snapshot'."""
+    v = BookValidator(depth_limit=depth_limit)
+    source_messages = 0
+    empty: set[int] = set()
+    for p in paths:
+        man = read_manifest(p)
+        source_messages += man["messages"]
+        empty.update(man.get("empty_update_ids", []))
+        for msg in iter_book_messages(p):
+            v.feed(msg)
+    rep = v.r.to_dict()
+    rep["files"] = len(paths)
+    rep["empty_messages_in_source"] = len(empty)
+    rep["message_count_matches_source"] = rep["messages"] + len(empty) == source_messages
+    return rep
+
+
+def validate_live_session(session_dir: Path) -> dict:
+    """Validate a recorder session directory (rust/recorder output)."""
+    session_dir = Path(session_dir)
+    books = sorted((session_dir / "book_updates").glob("*.parquet"))
+    trades = sorted((session_dir / "trades").glob("*.parquet"))
+    depth = None
+    if books:
+        topic = read_manifest(books[0])["topics"][0]  # orderbook.<depth>.<symbol>
+        depth = int(topic.split(".")[1])
+    out: dict = {"session": session_dir.name, "book_depth": depth}
+    out["book"] = validate_book_files(books, depth) if books else None
+    if trades:
+        t = pa.concat_tables([pq.read_table(p) for p in trades])
+        out["trades"] = {
+            "files": len(trades),
+            "rows": t.num_rows,
+            "duplicate_trade_ids": t.num_rows - pc.count_distinct(t.column("trade_id")).as_py(),
+            "ts_local_nulls": t.column("ts_local_ms").null_count,
+        }
+    summary = session_dir / "summary.json"
+    if summary.exists():
+        out["recorder_summary"] = json.loads(summary.read_text())
+    return out
+
+
+if __name__ == "__main__":
+    import sys
+
+    rep = validate_live_session(Path(sys.argv[1]))
+    print(json.dumps({k: v for k, v in rep.items() if k != "recorder_summary"}, indent=2, default=str))

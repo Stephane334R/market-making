@@ -59,3 +59,27 @@ gaps cannot be detected from historical files alone.
 
 Source file name and SHA-256, tick/lot sizes, row/message counts, snapshot/delta counts,
 topics seen, `empty_update_ids` (book only), source CSV header (trades only).
+
+## Live recordings (rust/recorder)
+
+Same columns, units, footer metadata and manifests as above, written by the Rust recorder:
+
+```
+data/live/<SYMBOL>/<session UTC start>/book_updates/<window>.parquet (+ .manifest.json)
+data/live/<SYMBOL>/<session UTC start>/trades/<window>.parquet       (+ .manifest.json)
+data/live/<SYMBOL>/<session UTC start>/events.jsonl   gaps, resyncs, reconnects, REST checks
+data/live/<SYMBOL>/<session UTC start>/summary.json   counters + list of files
+```
+
+Differences from historical files:
+
+- Source topic `orderbook.1000.<SYMBOL>` (deepest public level, 200 ms) instead of the 200-level archive.
+- `ts_local_ms` is filled: wall-clock time when the frame was read from the socket
+  (local clock; its offset to exchange time is not measured: a **latency simplification**).
+- trades `ts_exchange_ms` = websocket `T` (fill time), the same meaning as the archive `timestamp`.
+- Files are rotated on wall-clock windows (default 5 min). The book carries across files,
+  so validate a session's files **as one stream** (`mm.validate.validate_live_session`).
+- `update_id` is **not unique** within a session: after a gap or reconnect the recorder
+  resubscribes, and Bybit's fresh snapshot can be older than deltas already received
+  (observed: up to ~3 s), after which the following update ids are sent again. Always
+  process rows in file order and reset the book at each snapshot.

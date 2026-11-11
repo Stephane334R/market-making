@@ -74,3 +74,63 @@ Tests: `tests/test_book.py`, `tests/test_normalize.py`, `tests/test_download.py`
   once the schema is extended. Cross-check trades against the book (trade price within
   the spread at `cts`). Alert on any non-zero anomaly counter. Pin and record the
   instrument spec per day from `instruments-info`.
+
+## 2. Live recorder (`rust/recorder`)
+
+Code: `src/main.rs` (CLI, connection loop, message handling, REST check), `src/book.rs`
+(local L2 book + gap rule), `src/sink.rs` (rotated Parquet), `src/bybit.rs` (wire formats,
+REST), `src/units.rs` (exact decimal -> int). Rust unit tests in `book.rs`/`units.rs`;
+`tests/test_recorded.py` checks a recorded session with the Python validator.
+
+- **What:** subscribes to `orderbook.1000.BTCUSDT` (deepest public level, 200 ms) and
+  `publicTrade.BTCUSDT` on `wss://stream.bybit.com/v5/public/linear`, keeps a local book,
+  writes the common schema to Parquet rotated every N minutes (`--rotate-minutes`, default 5),
+  and logs every anomaly to `events.jsonl`. Run: `rust/target/release/recorder --minutes 10`.
+- **Why Rust:** one long-running process with predictable latency and memory; the Python
+  validator stays the single reference for correctness checks.
+- **Verified in Bybit docs (2026-11):** endpoint; linear depths 1/50/200/1000; snapshot/delta
+  format with `u` (update id) and `seq` (cross sequence); `publicTrade` fields
+  (`T,s,S,v,p,L,i,BT,RPI,seq`); ping `{"op":"ping"}` every 20 s (connection cut after 10 min
+  without traffic); `unsubscribe` op; REST `/v5/market/orderbook` (limit 1-1000).
+- **Gap handling:** a delta must have `u == prev_u + 1` (empirical, holds on archive and
+  live data). On a gap: log it, mark the book invalid, `unsubscribe` + `subscribe` the
+  orderbook topic, and rebuild from the snapshot that follows. Deltas that arrive while
+  invalid are still **written** (never dropped) but not applied. On disconnect/stale stream
+  (no frame for 30 s): reconnect with exponential backoff 1 s -> 60 s, reset to 1 s after a
+  session that produced a valid book.
+- **Surprise found live:** the snapshot sent after a resubscribe can be *older* than the
+  deltas already received (seen: 16 updates / 3.2 s behind); Bybit then re-sends those
+  update ids. So `update_id` is not unique in a session, and `seq`/`ts` go backwards exactly
+  at resync points. The recorder clears its REST-alignment history on every reset; the
+  Python test allows those anomalies only at gap/resync points.
+- **REST quality check:** every 60 s fetch the top 50 levels from REST. The REST `u` is in the
+  same id space as `orderbook.1000` (verified live), so the check compares against the local
+  book **at exactly that `u`** (a ring buffer of recent top-50 states; waits up to 10 s if the
+  stream lags behind REST). A level-by-level comparison means any mismatch is a real bug,
+  not timing noise. `rest_unaligned` is logged when that `u` is not in the buffer (e.g. a
+  REST reply that predates a reconnect).
+- **Testing the failure path:** `--simulate-gap-secs N` (TESTING ONLY) discards one delta
+  before writing every N s. A 3-minute run: 2 drops -> 2 gaps -> 2 resubscribes -> 2 rebuilds,
+  all REST checks matched afterwards; Python found the same 2 gaps and 3 resyncs.
+- **Clean shutdown:** Ctrl-C or `--minutes` -> close the socket, flush buffers, close Parquet
+  writers, rename `.tmp` -> `.parquet`, write manifests and `summary.json`. A crash leaves only
+  `.tmp` files, never a truncated `.parquet`.
+- **Assumptions / simplifications (labelled):**
+  - `ts_local_ms` is the local wall clock at socket read; clock offset to Bybit is not
+    measured (**latency simplification**). `--minutes` counts monotonic time, which does not
+    advance while the machine sleeps (seen in the 10-minute test run).
+  - `cts` and the trade `RPI`/`BT`/`L`/`seq` fields are not in the common schema and are dropped.
+  - RPI orders are excluded from the public orderbook stream by Bybit.
+  - Trade loss cannot be detected (no trade sequence); disconnect windows in `events.jsonl`
+    mark where trades may be missing.
+  - The tick/lot sizes are read once at start-up from `instruments-info`.
+- **What can go wrong:** local network or sleep/resume (handled: reconnect + fresh snapshot);
+  Bybit changing message shape (parsing fails loudly and stops rather than writing wrong data);
+  an off-tick price (fatal by design); disk full (write error stops the session); a slow
+  consumer — everything runs on one task, so a long Parquet flush delays reads (fine at
+  ~5 msg/s, not for many symbols).
+- **Production-grade:** run on a VPS close to Bybit (Singapore/Tokyo) with chrony and a
+  measured clock offset; supervise with systemd and alert on gaps, disconnects and REST
+  mismatches; two redundant recorders on separate connections and a merge step; separate
+  the network reader from the writer (bounded channel) and record raw frames as well;
+  extend the schema with `cts` and trade `seq`/RPI; capture the instrument spec per file.
