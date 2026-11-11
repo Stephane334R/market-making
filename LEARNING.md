@@ -199,3 +199,92 @@ Tests: `tests/test_simulator.py` (original tests ported plus L2 queue tests),
   - Add funding and a toxicity filter.
   - Validate the fill model against live fills on testnet.
   - Use many more days, across regimes.
+
+## 4. Rust fill simulator (`rust/sim`)
+
+Code: `src/input.rs` (Parquet readers), `src/engine.rs` (the fill engine), `src/output.rs`
+(Parquet writers), `src/main.rs` (CLI, time merge, timings). Parity: `tests/test_rust_parity.py`.
+Benchmark: `python -m mm.bench_sim` -> `results/bench_sim_<UTC>/`.
+
+- **What:** a port of the *fill simulator only*. The strategy stays in Python. Python records
+  every requote as a **quote schedule** (`msg_index, ts, bid_px, ask_px, bid_sz, ask_sz`;
+  `Runner(record_quotes=True)`, `run_reference(..., quotes=True)`). Rust replays that
+  schedule over the same book + trades and writes `fills.parquet`, `states.parquet` and
+  `run.json`.
+- **Why a schedule is enough:** quotes depend on inventory, and inventory depends on fills.
+  If Rust fills exactly like Python, inventory evolves identically, and the strategy would
+  have produced exactly this schedule. Parity on fills therefore validates the whole loop
+  for that day. (The schedule is only valid for the run it was recorded from.)
+- **Key keyed on message index, not time:** a quote is attached to the N-th book message,
+  so ties between book messages sharing a timestamp cannot shift it. Rust also checks
+  `ts` and fails if they disagree, or if any scheduled quote is left unused.
+- **Bit-identical, not approximately equal:** every float expression keeps Python's
+  operation order (`side * qty * (mid - px)` is `(side*qty)*(mid-px)` in both). Python's
+  `min`/`max` builtins return the first argument on ties; `py_min`/`py_max` mirror that
+  rather than `f64::min/max`, whose signed-zero behaviour differs. The tests compare with
+  `check_exact=True`.
+
+### Data structures and ownership
+
+- **Book:** two `BTreeMap<i64, i64>` (price ticks -> size lots). The best bid is
+  `last_key_value()` and the best ask `first_key_value()`, both O(log n). Python uses
+  dicts plus `max()/min()` over ~200 keys per message, which is O(n) but fast in C. In
+  Rust the ordered map is the natural fit and avoids a scan per update.
+- **Orders:** `Option<Order>` fields `bid` and `ask`, owned by the `Engine`. `Order` holds
+  `px`, `rem` (coin left), `queue` (coin ahead of us), `traded` (prints at our price since
+  the last level update) and `watched`.
+  - Python keeps a `watch` dict (price -> list of (runner, order)) because one pass runs
+    many runners. Rust runs one schedule, so "is this level update about my order?" is
+    just `order.watched && order.px == p`. No shared references, no `Rc<RefCell<_>>`.
+  - Replacing an order is assigning a new `Option`, which drops the old one. That is the
+    "cancel" (and the unwatch) for free.
+- **Queue estimate:** stored *inside* the order (`queue`, `traded`). `level_change` is an
+  associated function taking `&mut Option<Order>` instead of a `&mut self` method. That
+  lets `apply_book` hold `&mut self.bids` (the book) and `&mut self.bid` (the order) at
+  the same time: disjoint field borrows, which the borrow checker accepts, whereas a
+  method call would borrow all of `self`.
+- **Messages:** `BookReader::next_message(&mut self, out: &mut BookMsg)` refills a
+  **caller-owned** buffer (vectors cleared, capacity kept), so there are no per-message
+  allocations over 864k messages. It cannot be a standard `Iterator` returning references
+  into its own buffer (that would be a "lending iterator"). Borrowing the output buffer
+  from the caller is the simple safe alternative.
+- **Columns:** the reader keeps the current Arrow batch's columns (`Int64Array`, ... :
+  cheap reference-counted clones of Arrow buffers) and a row cursor, and pulls the next
+  batch when the cursor runs out. Memory stays bounded by one batch (262k rows).
+- **Trades and quotes:** loaded whole into `Vec<Trade>` / `Vec<QuoteRow>` (`Copy` structs:
+  32 B per trade with alignment padding, ~71 MB for 2.2M trades) and walked with an index. That is simpler than
+  a second streaming cursor for the time merge.
+- **Outputs:** `Vec<Fill>` (array of structs: one push per fill) and `States` (struct of
+  arrays: one `Vec` per output column), so writing Arrow columns is a straight copy.
+
+### Results
+
+- **Parity:** bit-identical fills and 1 s states with Python on both reference days
+  (155 and 12,172 fills, 86,402 states), and on a synthetic day for both fill models.
+- **Benchmark (2026-11-09, 3.07M events = 864k book messages carrying 76M level updates
+  + 2.2M trades; Ryzen 7 3700U, single thread, Parquet I/O included):**
+
+  | run | wall time | events/s |
+  |---|---|---|
+  | Python strategy + sim | 85.0 s | 36k |
+  | Python sim only (same schedule) | 80.6 s | 38k |
+  | Rust sim | 8.4 s | 365k |
+
+  That is **9.6x**. Rust spends 8.1 of its 8.4 s in the replay loop, which includes
+  decoding 76M book rows from Parquet. The Python strategy itself costs only ~5%.
+
+- **Assumptions:** identical to `mm/simulator.py` (section 3), plus one more. A schedule is
+  tied to the exact book/trades files it was recorded on; there is no check beyond
+  `msg_index`/`ts` agreement.
+- **What can go wrong:**
+  - Changing one side without the other: the parity test catches it.
+  - Exporting a schedule from a run with different latency or sample settings than the
+    Rust run.
+  - Parquet compression the crate was not built with (pandas defaults to snappy; the
+    `snap` feature is enabled).
+- **Production-grade:**
+  - Port the strategy too, so parameter sweeps run fully in Rust.
+  - Run many parameter sets per pass, as in Python, with a per-price watch index.
+  - Parallelize across days.
+  - Decode only the columns needed, with a typed side column (bool or u8) instead of
+    strings.

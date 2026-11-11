@@ -108,11 +108,12 @@ def available_days(start: date | None, end: date | None) -> list[date]:
     return [x for x in days if (start is None or x >= start) and (end is None or x <= end)]
 
 
-def run_reference(day: date, params: QuoterParams, cfg: SimConfig, out: Path) -> dict:
-    """Full-resolution single-run output for one day: the reference for the Rust port."""
+def run_reference(day: date, params: QuoterParams, cfg: SimConfig, out: Path, quotes: bool = False) -> dict:
+    """Full-resolution single-run output for one day: the reference for the Rust port.
+    ``quotes=True`` also writes the quote schedule (quotes.parquet) that rust/sim replays."""
     bp, tp = norm_path("book_updates", SYMBOL, day), norm_path("trades", SYMBOL, day)
     cfg = replace(cfg, sample_ms=1000)
-    dr = run_day(bp, tp, [RunSpec("reference", params, cfg)])
+    dr = run_day(bp, tp, [RunSpec("reference", params, cfg, record_quotes=quotes)])
     r = dr.runners["reference"]
     fills, states = r.fills_df(), r.states_df()
     mo = analytics.markouts(fills, np.asarray(dr.engine.mids_ts), np.asarray(dr.engine.mids))
@@ -120,6 +121,8 @@ def run_reference(day: date, params: QuoterParams, cfg: SimConfig, out: Path) ->
     out.mkdir(parents=True, exist_ok=True)
     fills.to_csv(out / "fills.csv", index=False)
     states.to_parquet(out / "states.parquet", index=False)
+    if quotes:
+        r.quotes_df().to_parquet(out / "quotes.parquet", index=False)
     units = read_units(bp)
     cfg_json = {
         "day": day.isoformat(), "symbol": SYMBOL, "params": asdict(params), "sim_config": asdict(cfg),

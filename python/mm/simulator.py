@@ -96,8 +96,13 @@ class Order:
 class Runner:
     """One parameter set: quoter, orders, inventory and PnL accounting."""
 
-    def __init__(self, name: str, params: QuoterParams, cfg: SimConfig, vol: EwmaVol):
+    def __init__(self, name: str, params: QuoterParams, cfg: SimConfig, vol: EwmaVol,
+                 record_quotes: bool = False):
         self.name, self.params, self.cfg = name, params, cfg
+        # Quote schedule (book message index, decision ts, prices, sizes): the input of
+        # the Rust fill simulator (rust/sim), which replays quotes without the strategy.
+        self.record_quotes = record_quotes
+        self.quotes: list[tuple] = []
         self.quoter = InventorySkewQuoter(params, vol)
         self.l2 = cfg.fill_model == "l2_queue"
         self.q = self.cash = self.edge = self.inv = self.fees = 0.0
@@ -142,6 +147,11 @@ class Runner:
         s["equity"] = s["cash"] + s["inventory"] * s["mid"]
         return s
 
+    def quotes_df(self) -> pd.DataFrame:
+        df = pd.DataFrame(self.quotes, columns=["msg_index", "ts", "bid_px", "ask_px", "bid_sz", "ask_sz"])
+        return df.astype({"msg_index": "int64", "ts": "int64", "bid_px": "Int64", "ask_px": "Int64",
+                          "bid_sz": "float64", "ask_sz": "float64"})
+
     def stats(self) -> dict:
         return {"quotes": self.n_quotes, "post_only_rejects": self.n_rejects,
                 "mean_half_spread_bps": self.half_spread_sum / self.n_quotes if self.n_quotes else None}
@@ -169,6 +179,7 @@ class Engine:
         self.max_bid = self.min_ask = None  # bounds over resting orders, to skip trades fast
         self.mids_ts, self.mids = array("q"), array("d")
         self.last_ts: int | None = None
+        self.n_book = 0  # book messages seen (index used by the exported quote schedule)
 
     # -- order bookkeeping ----------------------------------------------------
     def _unwatch(self, r: Runner, o: Order | None, watch: dict) -> None:
@@ -260,6 +271,8 @@ class Engine:
     # -- events ------------------------------------------------------------------
     def on_book(self, m: BookMessage) -> None:
         ts = m.ts_exchange_ms
+        idx = self.n_book
+        self.n_book += 1
         self._event_start(ts)
         self._apply_book(m)
         if not self.bids or not self.asks:
@@ -276,6 +289,8 @@ class Engine:
                 r.pending = qt
                 r.n_quotes += 1
                 r.half_spread_sum += qt.half_spread_bps
+                if r.record_quotes:
+                    r.quotes.append((idx, ts, qt.bid_px, qt.ask_px, qt.bid_sz, qt.ask_sz))
             self.pending_ts = ts + self.latency_ms
             self.last_quote_ts = ts
         if ts >= self.next_sample:
@@ -355,6 +370,7 @@ class RunSpec:
     name: str
     params: QuoterParams
     cfg: SimConfig
+    record_quotes: bool = False
 
 
 @dataclass
@@ -370,7 +386,7 @@ def run_day(book_path: Path, trades_path: Path, specs: list[RunSpec]) -> DayRun:
     if len(halflives) != 1:
         raise ValueError("specs in one pass must share vol_halflife_s (shared EWMA)")
     vol = EwmaVol(halflives.pop())
-    runners = [Runner(s.name, s.params, s.cfg, vol) for s in specs]
+    runners = [Runner(s.name, s.params, s.cfg, vol, s.record_quotes) for s in specs]
     eng = Engine(runners, float(units.tick_size), float(units.lot_size), vol)
     replay(iter_book_messages(book_path), iter_trades(trades_path), eng)
     return DayRun(eng, {r.name: r for r in runners})
